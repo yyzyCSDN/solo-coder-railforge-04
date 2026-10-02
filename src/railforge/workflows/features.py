@@ -56,6 +56,17 @@ class RailForgeFeatureService:
             return {"clear": True, "wagons": len(wagons)}
         return self.control.run(operation_id, "feature.route.clearance", operation_id, at, action)
 
+    def check_oversize_clearance(self, operation_id, consist, sections, blockades, version, at,
+                                subject=None):
+        return self.control.check_oversize_clearance(
+            operation_id, consist, sections, blockades, subject or operation_id, at, version)
+
+    def reserve_oversize_path(self, operation_id, consist, sections, blockades, version, at,
+                              reference_version=None, subject=None):
+        return self.control.reserve_oversize_path(
+            operation_id, consist, sections, blockades, subject or operation_id, at, version,
+            reference_version)
+
     def rebalance_yard(self, operation_id, cuts, tracks, occupied, route, switches, owner, at):
         def action():
             assignment = classify(cuts, tracks, occupied)

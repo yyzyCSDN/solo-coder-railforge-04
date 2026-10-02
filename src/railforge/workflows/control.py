@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -21,6 +22,7 @@ from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
+from railforge.routing.oversize_clearance import check as oversize_clearance_check
 from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
@@ -68,6 +70,7 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._oversize_lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
@@ -86,6 +89,28 @@ class RailForgeWorkflowControl:
             "operation_id": operation_id,
             "status": "committed",
             "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
+            "version": version,
+            "result": _safe(result),
+            **dict(evidence or {}),
+        }
+        event = self.stream.publish(operation_id, at, topic, subject, payload)
+        audit = self.trail.append("railforge-control", topic, subject, at)
+        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+        self._receipts[operation_id] = receipt
+        return receipt
+
+    def _publish(self, operation_id: str, topic: str, subject: str, at: datetime,
+                 result: Any, status: str, version: int,
+                 evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
+        previous = self._receipts.get(operation_id)
+        if previous is not None:
+            if previous.topic != topic or previous.subject != subject:
+                raise ValueError("operation id reused for a different workflow")
+            return previous
+        payload = {
+            "operation_id": operation_id,
+            "status": status,
+            "control_path": "atomic",
             "version": version,
             "result": _safe(result),
             **dict(evidence or {}),
@@ -179,6 +204,98 @@ class RailForgeWorkflowControl:
     def check_clearance(self, operation_id, profile, segments, subject, at):
         return self._commit(operation_id, "routing.clearance.checked", subject, at,
                             lambda: route_ok(profile, segments))
+
+    def check_oversize_clearance(self, operation_id, consist, sections, blockades, subject,
+                                at, reference_version=0):
+        decision = oversize_clearance_check(consist, sections, blockades, at)
+        if not decision.allowed:
+            failure = decision.first_failure
+            return self._publish(
+                operation_id, "routing.oversize_clearance.rejected", subject, at,
+                decision, "rejected", reference_version,
+                {"reference_version": reference_version,
+                 "first_failed_section": failure.section_id,
+                 "reason": failure.reason,
+                 "failure": _safe(failure)})
+        return self._publish(
+            operation_id, "routing.oversize_clearance.checked", subject, at,
+            decision, "checked", reference_version,
+            {"reference_version": reference_version})
+
+    def reserve_oversize_path(self, operation_id, consist, sections, blockades, subject,
+                              at, expected_version, reference_version=None):
+        decision = oversize_clearance_check(consist, sections, blockades, at)
+        if reference_version is None:
+            reference_version = expected_version
+        if not decision.allowed:
+            failure = decision.first_failure
+            return self._publish(
+                operation_id, "routing.oversize_clearance.rejected", subject, at,
+                decision, "rejected", reference_version,
+                {"reference_version": reference_version,
+                 "first_failed_section": failure.section_id,
+                 "reason": failure.reason,
+                 "failure": _safe(failure)})
+
+        return self._commit_oversize_reservation(
+            operation_id, subject, at, expected_version, reference_version, decision)
+
+    def _commit_oversize_reservation(self, operation_id, subject, at, expected_version,
+                                     reference_version, decision):
+        with self._oversize_lock:
+            key = "oversize-path:" + subject + ":" + ":".join(decision.checked_sections)
+            current = self.store.read(key)
+            actual_version = current.version if current else 0
+            if expected_version != actual_version:
+                return self._publish_oversize_version_conflict(
+                    operation_id, subject, at, expected_version, actual_version,
+                    reference_version, decision.checked_sections)
+
+            reservation = {
+                "reserved": True,
+                "revoked": False,
+                "subject": subject,
+                "route": decision.checked_sections,
+                "reference_version": reference_version,
+            }
+            try:
+                version = self.store.write(key, _safe(reservation), expected_version)
+            except RuntimeError:
+                current = self.store.read(key)
+                actual_version = current.version if current else 0
+                return self._publish_oversize_version_conflict(
+                    operation_id, subject, at, expected_version, actual_version,
+                    reference_version, decision.checked_sections)
+            return self._publish(
+                operation_id, "routing.oversize_path.reserved", subject, at,
+                reservation, "reserved", version,
+                {"reference_version": reference_version})
+
+    def _publish_oversize_version_conflict(self, operation_id, subject, at,
+                                           expected_version, actual_version,
+                                           reference_version, route):
+        with self._oversize_lock:
+            if actual_version:
+                key = "oversize-path:" + subject + ":" + ":".join(route)
+                current = self.store.read(key)
+                if current and isinstance(current.value, dict) and current.value.get("reserved"):
+                    revoked = dict(current.value)
+                    revoked.update({"reserved": False, "revoked": True, "reason": "version conflict"})
+                    self.store.write(key, _safe(revoked), actual_version)
+                    actual_version += 1
+            result = {
+                "reserved": False,
+                "revoked": True,
+                "reason": "version conflict",
+                "expected_version": expected_version,
+                "actual_version": actual_version,
+                "reference_version": reference_version,
+                "route": route,
+            }
+            return self._publish(
+                operation_id, "routing.oversize_path.revoked", subject, at,
+                result, "revoked", actual_version,
+                {"reference_version": reference_version})
 
     def allocate_wagons(self, operation_id, rows, wagon_type, location, on, count, required_days, forbidden, subject, at):
         return self._commit(operation_id, "inventory.wagons.allocated", subject, at,

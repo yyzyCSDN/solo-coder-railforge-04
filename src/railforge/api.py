@@ -3,6 +3,7 @@ from __future__ import annotations
 from railforge.braking.brake_percentage import brake_percentage
 from railforge.consist.integrity import validate
 from railforge.routing.clearance import route_ok
+from railforge.routing.oversize_clearance import check as oversize_route_check
 from railforge.signaling.block_occupancy import conflicts
 from railforge.workflows.control import RailForgeWorkflowControl
 from railforge.workflows.features import RailForgeFeatureService
@@ -34,6 +35,20 @@ class RailForgeService:
 
     def route_clearance(self, profile, segments):
         return route_ok(profile, segments)
+
+    def oversize_clearance(self, consist, sections, blockades=None, at=None):
+        return oversize_route_check(consist, sections, blockades, at)
+
+    def check_oversize_clearance(self, operation_id, consist, sections, blockades, version, at,
+                                 subject=None):
+        return self.control.check_oversize_clearance(
+            operation_id, consist, sections, blockades, subject or operation_id, at, version)
+
+    def reserve_oversize_path(self, operation_id, consist, sections, blockades, version, at,
+                              reference_version=None, subject=None):
+        return self.control.reserve_oversize_path(
+            operation_id, consist, sections, blockades, subject or operation_id, at, version,
+            reference_version)
 
     def workflow(self):
         return self.control
