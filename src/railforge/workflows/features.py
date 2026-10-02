@@ -56,6 +56,26 @@ class RailForgeFeatureService:
             return {"clear": True, "wagons": len(wagons)}
         return self.control.run(operation_id, "feature.route.clearance", operation_id, at, action)
 
+    def clear_out_of_gauge_route(self, operation_id, request, reservation_id, at):
+        """Verify full-route gauge clearance first; reserve the path only on a pass."""
+        check = self.control.check_gauge_clearance(operation_id + ":check", request, at)
+        if not check.result.passed:
+            return check
+        sections = [p.section for p in request.route]
+        return self.control.reserve_gauge_path(operation_id + ":reserve", reservation_id,
+                                               request.train, sections, request.data_version, at)
+
+    def publish_gauge_data_version(self, operation_id, new_version, at):
+        """Publish a new clearance-data version; every conflicting reservation is revoked."""
+        def action():
+            revoked = self.control.gauge_paths.revoke_stale(new_version, at)
+            for r in revoked:
+                self.control.revalidate_gauge_path(
+                    operation_id + ":revoke:" + r.reservation_id, r.reservation_id, new_version, at)
+            return {"new_version": new_version, "revoked": [r.reservation_id for r in revoked]}
+        return self.control.run(operation_id, "routing.gauge.data_published",
+                                "gauge-clearance-data", at, action)
+
     def rebalance_yard(self, operation_id, cuts, tracks, occupied, route, switches, owner, at):
         def action():
             assignment = classify(cuts, tracks, occupied)

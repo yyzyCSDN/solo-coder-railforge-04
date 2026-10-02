@@ -21,6 +21,8 @@ from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
+from railforge.routing.gauge_clearance import GaugePathRegistry
+from railforge.routing.gauge_clearance import verify as gauge_verify
 from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
@@ -66,6 +68,7 @@ class RailForgeWorkflowControl:
         self.stream = stream or EventStream()
         self.trail = trail or Trail()
         self.store = store or VersionedStore()
+        self.gauge_paths = GaugePathRegistry()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
 
@@ -179,6 +182,29 @@ class RailForgeWorkflowControl:
     def check_clearance(self, operation_id, profile, segments, subject, at):
         return self._commit(operation_id, "routing.clearance.checked", subject, at,
                             lambda: route_ok(profile, segments))
+
+    def check_gauge_clearance(self, operation_id, request, at):
+        verdict = gauge_verify(request)
+        topic = "routing.gauge.cleared" if verdict.passed else "routing.gauge.rejected"
+
+        def action():
+            if verdict.passed:
+                self.gauge_paths.record_pass(verdict)
+            return verdict
+
+        evidence = None if verdict.passed else {"first_failed_section": verdict.first_failure.section}
+        return self._commit(operation_id, topic, request.train, at, action, evidence)
+
+    def reserve_gauge_path(self, operation_id, reservation_id, train, sections, data_version, at):
+        return self._commit(operation_id, "routing.gauge.path_reserved", train, at,
+                            lambda: self.gauge_paths.reserve(reservation_id, train,
+                                                             tuple(sections), data_version, at))
+
+    def revalidate_gauge_path(self, operation_id, reservation_id, current_version, at):
+        status, reservation = self.gauge_paths.revalidate(reservation_id, current_version, at)
+        topic = "routing.gauge.reservation_" + status
+        return self._commit(operation_id, topic, reservation.train, at,
+                            lambda: reservation, {"current_version": current_version})
 
     def allocate_wagons(self, operation_id, rows, wagon_type, location, on, count, required_days, forbidden, subject, at):
         return self._commit(operation_id, "inventory.wagons.allocated", subject, at,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from railforge.braking.brake_percentage import brake_percentage
 from railforge.consist.integrity import validate
 from railforge.routing.clearance import route_ok
+from railforge.routing.gauge_clearance import verify as gauge_verify
 from railforge.signaling.block_occupancy import conflicts
 from railforge.workflows.control import RailForgeWorkflowControl
 from railforge.workflows.features import RailForgeFeatureService
@@ -34,6 +35,9 @@ class RailForgeService:
 
     def route_clearance(self, profile, segments):
         return route_ok(profile, segments)
+
+    def gauge_clearance(self, request):
+        return gauge_verify(request)
 
     def workflow(self):
         return self.control
